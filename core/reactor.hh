@@ -47,6 +47,7 @@
 #include <atomic>
 #include <experimental/optional>
 #include <boost/lockfree/spsc_queue.hpp>
+#include <boost/lockfree/queue.hpp>
 #include <boost/optional.hpp>
 #include <boost/program_options.hpp>
 #include <set>
@@ -297,6 +298,91 @@ private:
     void submit_item(work_item* wi);
 
     friend class thread_pool;
+};
+
+template <typename... T>
+class safepost_result;
+
+struct safepost_queue
+{
+private:
+    struct work_item;
+
+    using lf_queue_base = boost::lockfree::queue<work_item *>;
+    struct lf_queue_remote {
+        reactor* remote;
+    };
+    struct lf_queue : lf_queue_remote, lf_queue_base {
+        lf_queue(reactor* remote) : lf_queue_remote{remote}, lf_queue_base(100) {}
+        void maybe_wakeup();
+    };
+    struct work_item {
+        virtual ~work_item() {}
+        virtual void reactor_complete() = 0;
+    };
+public:
+    //has all the state of the safepost
+    template <typename... T>
+    struct async_work_item : work_item {
+        promise<T...> _promise; // used on local side
+        future_state<T...> _result;
+        safepost_queue *_queue;
+        async_work_item(safepost_queue *queue) : _queue(queue) {}
+
+        //called on creating the async_work_item. return a safepost_result that can be set later
+        safepost_result<T...> submit() {
+            return safepost_result<T...>(_result, _promise, this);
+        }
+
+        //when safepost_result gets set, enqueues to and notifies the reactor
+        virtual void safepost_complete() {
+            _queue->enqueue(this);
+        }
+
+        //called on the reactor thread to notify the promise of completion
+        virtual void reactor_complete() override {
+            assert(_result.available());
+            if (_result.failed()) {
+                // FIXME: _ex was allocated on another cpu
+                _promise.set_exception(std::move(_result.get_exception()));
+            } else {
+                _promise.set_value(std::move(_result.get()));
+            }
+        };
+    };
+    lf_queue _messages;
+public:
+    safepost_queue(reactor* me);
+    //submit to safepost for this reactor
+    template<typename... T>
+    safepost_result<T...> submit() {
+        async_work_item<T...> * work_item = new async_work_item<T...>(this);
+        return work_item->submit();
+    }
+    void enqueue(work_item * item);
+    size_t process_waiting();
+};
+
+template <typename... T> 
+struct safepost_result {
+    future_state<T...> & _result;
+    future<T...> get_future()
+    {
+        return _promise.get_future();
+    }
+    promise<T...> & _promise;
+    safepost_queue::async_work_item<T...> * _work_item;
+    void set_value(T&&... t) {
+        _result.set(std::forward<T>(t)...);
+        _work_item->safepost_complete();
+    }
+    void set_exception(std::exception_ptr ex) {
+        _result.set_exception(ex);
+        _work_item->safepost_complete();
+    }
+    safepost_result(future_state<T...> & result, promise<T...> &promise, safepost_queue::async_work_item<T...> * work_item)
+        : _result(result), _promise(promise), _work_item(work_item){}
+    //safepost_result(const safepost_result & result) = delete;
 };
 
 class smp_message_queue {
@@ -594,6 +680,7 @@ private:
     class drain_cross_cpu_freelist_pollfn;
     class lowres_timer_pollfn;
     class epoll_pollfn;
+    class safepost_pollfn;
     friend io_pollfn;
     friend signal_pollfn;
     friend aio_batch_submit_pollfn;
@@ -602,6 +689,7 @@ private:
     friend drain_cross_cpu_freelist_pollfn;
     friend lowres_timer_pollfn;
     friend class epoll_pollfn;
+    friend class safepost_pollfn;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;
@@ -755,6 +843,9 @@ public:
 
     void configure(boost::program_options::variables_map config);
 
+    template <typename... Result>
+    safepost_result<Result...> safe_post();
+
     server_socket listen(socket_address sa, listen_options opts = {});
 
     future<connected_socket> connect(socket_address sa);
@@ -859,6 +950,7 @@ private:
     friend class timer<lowres_clock>;
     friend class smp;
     friend class smp_message_queue;
+    friend class safepost_queue;
     friend class poller;
     friend void add_to_flush_poller(output_stream<char>* os);
 public:
@@ -932,6 +1024,7 @@ class smp {
     static std::vector<thread_adaptor> _threads;
     static std::vector<reactor*> _reactors;
     static smp_message_queue** _qs;
+    static std::vector<safepost_queue*> _safepost_qs;
     static std::thread::id _tmain;
 
     template <typename Func>
@@ -944,6 +1037,12 @@ public:
     static void cleanup();
     static void join_all();
     static bool main_thread() { return std::this_thread::get_id() == _tmain; }
+
+    template <typename... Result>
+    static safepost_result<Result...> safepost_submit() {
+        auto result = _safepost_qs[engine().cpu_id()]->submit<Result...>();
+        return result;
+    }
 
     /// Runs a function on a remote core.
     ///
@@ -979,6 +1078,12 @@ public:
             return _qs[t][engine().cpu_id()].submit(std::forward<Func>(func));
         }
     }
+    static bool check_safepost_queues() {
+        auto i = engine().cpu_id();
+        auto & q = _safepost_qs[i];
+        size_t processed = q->process_waiting();
+        return processed != 0;
+    };
     static bool poll_queues() {
         size_t got = 0;
         for (unsigned i = 0; i < count; i++) {
@@ -1109,6 +1214,12 @@ future<>
 reactor::write_all(pollable_fd_state& fd, const void* buffer, size_t len) {
     assert(len);
     return write_all_part(fd, buffer, len, 0);
+}
+
+template <typename... Result>
+safepost_result<Result...> reactor::safe_post()
+{
+    return smp::safepost_submit<Result...>();
 }
 
 inline

@@ -1584,6 +1584,29 @@ public:
     }
 };
 
+//a pollfn that handles posts from non-seastar threads
+class reactor::safepost_pollfn final : public reactor::pollfn {
+    reactor& _r;
+public:
+    safepost_pollfn(reactor& r) : _r(r) {}
+    virtual bool poll() final override {
+        return smp::check_safepost_queues();
+    }
+    virtual bool try_enter_interrupt_mode() override {
+        _r._sleeping.store(true, std::memory_order_relaxed);
+        systemwide_memory_barrier();
+        if (poll()) {
+            // raced
+            _r._sleeping.store(false, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+    virtual void exit_interrupt_mode() override final {
+        _r._sleeping.store(false, std::memory_order_relaxed);
+    }
+};
+
 class reactor::smp_pollfn final : public reactor::pollfn {
     reactor& _r;
 public:
@@ -1664,6 +1687,9 @@ int reactor::run() {
     if (smp::count > 1) {
         smp_poller = poller(std::make_unique<smp_pollfn>(*this));
     }
+
+    // Register safepost poller
+    std::unique_ptr<poller> safepost_poller = std::make_unique<poller>(std::make_unique<safepost_pollfn>(*this));
 
 #ifndef HAVE_OSV
     _signals.handle_signal(alarm_signal(), [this] {
@@ -2091,6 +2117,43 @@ void smp_message_queue::start(unsigned cpuid) {
     });
 }
 
+safepost_queue::safepost_queue(reactor* to): _messages(to) {
+}
+
+//called by a third party thread to notify the reactor that a request is completing
+void safepost_queue::enqueue(work_item * item) {
+    bool result = _messages.push(item);
+    //queue is unbounded, we should expect it to always succeed
+    assert(result);
+    //signal to destination reactor to check
+    _messages.maybe_wakeup();
+}
+
+//called by the reactor thread to service completions coming from third party threads
+size_t safepost_queue::process_waiting() {
+    size_t num_popped = 0;
+    _messages.consume_all([&num_popped](auto && wi) {
+        wi->reactor_complete();
+        delete wi;
+        num_popped++;
+        });
+    return num_popped;
+}
+
+void safepost_queue::lf_queue::maybe_wakeup() {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    // in situations where the reactor isnt sleeping we are ok.
+    // if the reactor goes to sleep right after we have loaded _sleeping in the
+    // if below, the reactor thread will still
+    // run a poll() on the safepost_queue afterwards,  will see the data we just
+    // posted, and then set itself to sleeping = false
+    if (remote->_sleeping.load(std::memory_order_relaxed)) {
+        //if we see it is sleeping, schedule a wakeup
+        remote->_sleeping.store(false, std::memory_order_relaxed);
+        remote->wakeup();
+    }
+}
+
 /* not yet implemented for OSv. TODO: do the notification like we do class smp. */
 #ifndef HAVE_OSV
 thread_pool::thread_pool() : _worker_thread([this] { work(); }), _notify(pthread_self()) {
@@ -2293,6 +2356,7 @@ smp::get_options_description()
 std::vector<smp::thread_adaptor> smp::_threads;
 std::vector<reactor*> smp::_reactors;
 smp_message_queue** smp::_qs;
+std::vector<safepost_queue*> smp::_safepost_qs;
 std::thread::id smp::_tmain;
 unsigned smp::count = 1;
 
@@ -2525,6 +2589,12 @@ void smp::configure(boost::program_options::variables_map configuration)
         }
     }
     smp_queues_constructed.wait();
+
+    //start safepost queues
+    for (unsigned i = 0 ; i < smp::count ;i++) {
+	    _safepost_qs.emplace_back(new safepost_queue(_reactors[i]));
+    }
+
     start_all_queues();
     assign_io_queue(0, queue_idx);
     inited.wait();

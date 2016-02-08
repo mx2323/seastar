@@ -31,6 +31,23 @@ future<bool> test_smp_call() {
     });
 }
 
+std::unique_ptr<std::thread> third_party_thread = nullptr;
+future<bool> test_safepost() {
+	safepost_result<int> result = engine().safe_post<int>();
+
+	third_party_thread = std::make_unique<std::thread>([result]() mutable{
+			sleep(1);
+			result.set_value(1);
+		}
+	);
+
+	return result.get_future().then([](int i) {
+            third_party_thread->join();
+            third_party_thread.reset();
+            return make_ready_future<bool>(i == 1);
+        });
+};
+
 struct nasty_exception {};
 
 future<bool> test_smp_exception() {
@@ -68,11 +85,13 @@ report(sstring msg, future<bool>&& result) {
 
 int main(int ac, char** av) {
     return app_template().run_deprecated(ac, av, [] {
-       return report("smp call", test_smp_call()).then([] {
-           return report("smp exception", test_smp_exception());
-       }).then([] {
-           print("\n%d tests / %d failures\n", tests, fails);
-           engine().exit(fails ? 1 : 0);
-       });
+        return report("smp call", test_smp_call()).then([] {
+            return report("safe post", test_safepost());
+        }).then([] {
+            return report("smp exception", test_smp_exception());
+        }).then([] {
+            print("\n%d tests / %d failures\n", tests, fails);
+            engine().exit(fails ? 1 : 0);
+        });
     });
 }
