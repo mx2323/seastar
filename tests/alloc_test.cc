@@ -21,7 +21,7 @@
 
 #include "tests/test-utils.hh"
 #include "core/memory.hh"
-
+#include <thread>
 
 SEASTAR_TEST_CASE(alloc_almost_all_and_realloc_it_with_a_smaller_size) {
 #ifndef DEFAULT_ALLOCATOR
@@ -37,3 +37,29 @@ SEASTAR_TEST_CASE(alloc_almost_all_and_realloc_it_with_a_smaller_size) {
     return make_ready_future<>();
 }
 
+std::thread * foo = nullptr;
+SEASTAR_TEST_CASE(third_party_allocator) {
+#ifndef DEFAULT_ALLOCATOR
+	std::cout << "third party allocator test" << std::endl;
+    auto *a = malloc(4);
+    auto *b = realloc(nullptr, 4);
+    std::thread foo([](){
+        auto *i = malloc(4);
+        auto *j = realloc(nullptr, 4);
+        assert(!memory::is_seastar_memory(i));
+        assert(!memory::is_seastar_memory(j));
+		free(i);
+		free(j);
+	});
+    assert(memory::is_seastar_memory(a));
+    assert(memory::is_seastar_memory(b));
+    free(a);
+    free(b);
+	foo.join();
+#else
+    auto *i = malloc(4);
+    assert(!memory::is_seastar_memory(i));
+    free(i);
+#endif
+	return make_ready_future<>();
+}

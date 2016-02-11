@@ -234,6 +234,8 @@ arg_parser.add_argument('--dpdk-target', action = 'store', dest = 'dpdk_target',
                         help = 'Path to DPDK SDK target location (e.g. <DPDK SDK dir>/x86_64-native-linuxapp-gcc)')
 arg_parser.add_argument('--debuginfo', action = 'store', dest = 'debuginfo', type = int, default = 1,
                         help = 'Enable(1)/disable(0)compiler debug information generation')
+arg_parser.add_argument('--third_party_allocator', action = 'store', dest = 'third_party_allocator', default = None,
+                        help = 'specify a third party memory allocator for use in non-seastar threads. i.e., jemalloc')
 add_tristate(arg_parser, name = 'hwloc', dest = 'hwloc', help = 'hwloc support')
 add_tristate(arg_parser, name = 'xen', dest = 'xen', help = 'Xen support')
 args = arg_parser.parse_args()
@@ -293,7 +295,10 @@ boost_test_lib = [
 ]
 
 defines = []
-libs = '-laio -lboost_program_options -lboost_system -lboost_filesystem -lstdc++ -lm -lboost_unit_test_framework -lboost_thread -lcryptopp -lrt -lgnutls -lgnutlsxx'
+libs = ''
+if args.third_party_allocator:
+    libs = '-l{third_party_allocator} '.format(third_party_allocator=args.third_party_allocator);
+libs += '-laio -lboost_program_options -lboost_system -lboost_filesystem -lstdc++ -lm -lboost_unit_test_framework -lboost_thread -lcryptopp -lrt -lgnutls -lgnutlsxx -ldl'
 hwloc_libs = '-lhwloc -lnuma -lpciaccess -lxml2 -lz'
 xen_used = False
 def have_xen():
