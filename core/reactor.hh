@@ -833,6 +833,10 @@ public:
     ~reactor();
     void operator=(const reactor&) = delete;
 
+    thread_pool& get_thread_pool() {
+        return _thread_pool;
+    }
+
     const io_queue& get_io_queue() const {
         return *_io_queue;
     }
