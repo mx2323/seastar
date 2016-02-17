@@ -45,6 +45,7 @@
 #include <chrono>
 #include <ratio>
 #include <atomic>
+#include <future>
 #include <experimental/optional>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/lockfree/queue.hpp>
@@ -318,7 +319,7 @@ private:
     };
     struct work_item {
         virtual ~work_item() {}
-        virtual void reactor_complete() = 0;
+        virtual void reactor_run() = 0;
     };
 public:
     //has all the state of the safepost
@@ -334,13 +335,13 @@ public:
             return safepost_result<T...>(_result, _promise, this);
         }
 
-        //when safepost_result gets set, enqueues to and notifies the reactor
+        //when safepost_result gets set, enqueues thread safely and notifies the reactor
         virtual void safepost_complete() {
-            _queue->enqueue(this);
+            _queue->safe_enqueue(this);
         }
 
         //called on the reactor thread to notify the promise of completion
-        virtual void reactor_complete() override {
+        virtual void reactor_run() override {
             assert(_result.available());
             if (_result.failed()) {
                 // FIXME: _ex was allocated on another cpu
@@ -350,6 +351,36 @@ public:
             }
         };
     };
+
+    template <typename Result, typename Callable> 
+    struct safe_run_work_item : work_item {
+        safe_run_work_item(safepost_queue * queue, Callable && func):
+            _queue(queue), mFunc(std::move(func)) { 
+            _queue->safe_enqueue(this);
+        }
+        std::future<Result> get_future() {
+            return mPromise.get_future();
+        }
+
+        virtual void reactor_run() override {
+            
+            future<Result> future_to_run = mFunc();
+            future_to_run.then_wrapped([promise = std::move(mPromise)](auto && fut) mutable {
+                assert(fut.available());
+                if (fut.failed()) {
+                    promise.set_exception(fut.get_exception());
+                }
+                else {
+                    promise.set_value(std::move(fut.get0())); 
+                }
+            });
+        }
+
+        safepost_queue * _queue;
+        Callable mFunc;
+        std::promise<Result> mPromise;
+    };
+
     lf_queue _messages;
 public:
     safepost_queue(reactor* me);
@@ -359,7 +390,12 @@ public:
         async_work_item<T...> * work_item = new async_work_item<T...>(this);
         return work_item->submit();
     }
-    void enqueue(work_item * item);
+    template<typename Result, typename Callable>
+    std::future<Result> submit_saferun(Callable && callable) {
+        safe_run_work_item<Result, Callable> * work_item = new safe_run_work_item<Result,Callable>(this, std::move(callable));
+        return work_item->get_future();
+    }
+    void safe_enqueue(work_item * item);
     size_t process_waiting();
 };
 
@@ -850,6 +886,9 @@ public:
     template <typename... Result>
     safepost_result<Result...> safe_post();
 
+    template <typename Result, typename Callable> 
+    std::future<Result> safe_run(unsigned cpuid, Callable && callable);
+
     server_socket listen(socket_address sa, listen_options opts = {});
 
     future<connected_socket> connect(socket_address sa);
@@ -1048,6 +1087,12 @@ public:
         return result;
     }
 
+    template <typename Result, typename Callable>
+    static std::future<Result> saferun_submit(unsigned cpuid, Callable && callable) {
+        std::future<Result> result = _safepost_qs[cpuid]->submit_saferun<Result, Callable>(std::forward<Callable>(callable));
+        return result;
+    }
+
     /// Runs a function on a remote core.
     ///
     /// \param t designates the core to run the function on (may be a remote
@@ -1224,6 +1269,12 @@ template <typename... Result>
 safepost_result<Result...> reactor::safe_post()
 {
     return smp::safepost_submit<Result...>();
+}
+
+template <typename Result, typename Func> 
+std::future<Result> reactor::safe_run(unsigned cpuid, Func && func)
+{
+    return smp::saferun_submit<Result,Func>(cpuid, std::forward<Func>(func));
 }
 
 inline

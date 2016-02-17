@@ -2121,7 +2121,7 @@ safepost_queue::safepost_queue(reactor* to): _messages(to) {
 }
 
 //called by a third party thread to notify the reactor that a request is completing
-void safepost_queue::enqueue(work_item * item) {
+void safepost_queue::safe_enqueue(work_item * item) {
     bool result = _messages.push(item);
     //queue is unbounded, we should expect it to always succeed
     assert(result);
@@ -2133,7 +2133,7 @@ void safepost_queue::enqueue(work_item * item) {
 size_t safepost_queue::process_waiting() {
     size_t num_popped = 0;
     _messages.consume_all([&num_popped](auto && wi) {
-        wi->reactor_complete();
+        wi->reactor_run();
         delete wi;
         num_popped++;
         });

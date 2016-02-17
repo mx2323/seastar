@@ -22,6 +22,7 @@
 #include "core/reactor.hh"
 #include "core/app-template.hh"
 #include "core/print.hh"
+#include "core/sleep.hh"
 
 future<bool> test_smp_call() {
     return smp::submit_to(1, [] {
@@ -46,6 +47,37 @@ future<bool> test_safepost() {
             third_party_thread.reset();
             return make_ready_future<bool>(i == 1);
         });
+};
+
+template<typename... R>
+bool is_ready(std::future<R...> const& f) {
+    return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
+future<bool> test_saferun() {
+    std::future<int> fut = engine().safe_run<int>(0, []() ->future<int> {
+        return sleep(std::chrono::seconds(1))
+        .then([]() ->future<int> {
+            return make_ready_future<int>(1);
+        });
+    });
+	return repeat([fut = std::move(fut)]() mutable -> future<stop_iteration> {
+        if (is_ready(fut)) {
+        
+            assert(fut.get() == 1);
+            return make_ready_future<stop_iteration>(stop_iteration::yes);
+        }
+        else {
+            return sleep(std::chrono::seconds(1)).then([]() {
+                print("not complete\n");
+                return make_ready_future<stop_iteration>(stop_iteration::no);
+            });
+        }
+    })
+    .then([]() {
+        print("completed safe run\n");
+        return make_ready_future<bool>(true);
+    });
 };
 
 struct nasty_exception {};
@@ -85,10 +117,13 @@ report(sstring msg, future<bool>&& result) {
 
 int main(int ac, char** av) {
     return app_template().run_deprecated(ac, av, [] {
-        return report("smp call", test_smp_call()).then([] {
+        return report("smp call", test_smp_call())
+        .then([] {
             return report("safe post", test_safepost());
         }).then([] {
             return report("smp exception", test_smp_exception());
+        }).then([] {
+            return report("safe run", test_saferun());
         }).then([] {
             print("\n%d tests / %d failures\n", tests, fails);
             engine().exit(fails ? 1 : 0);
