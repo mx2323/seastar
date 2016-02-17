@@ -92,6 +92,52 @@ static thread_local uint64_t g_frees;
 static thread_local uint64_t g_cross_cpu_frees;
 static thread_local uint64_t g_reclaims;
 
+//has memory::configure() been called for this thread? this determines which memory allocator to use for news and frees 
+static thread_local bool configured = false;
+#include "dlfcn.h"
+//third_party memory allocator support 
+using malloc_func_type = void * (size_t);
+using free_func_type  = void (void *);
+using realloc_func_type = void * (void *, size_t);
+
+//while using dlsym inside of malloc, rely on the seastar memory allocator temporarily. 
+//this allows us to use dl* functions and do better debugging while initializing all 
+//the third party memory allocator functions.
+static std::atomic<int> in_load(0);
+
+template<typename FuncPtrType>
+FuncPtrType dlsym_next(const char * symbol) {
+    in_load++;
+    FuncPtrType funcPtr = reinterpret_cast<FuncPtrType>(dlsym(RTLD_NEXT, symbol));
+    assert(funcPtr);
+    in_load--;
+    return funcPtr;
+}
+
+malloc_func_type* get_third_party_malloc_func()
+{
+    static malloc_func_type* third_party_malloc = []() -> malloc_func_type * {
+        return dlsym_next<malloc_func_type*>("malloc");
+    }();
+    return third_party_malloc;
+}
+
+free_func_type* get_third_party_free_func()
+{
+	static free_func_type* third_party_free = []() -> free_func_type * {
+        return dlsym_next<free_func_type*>("free");
+	}();
+	return third_party_free;
+}
+
+realloc_func_type* get_third_party_realloc_func()
+{
+	static realloc_func_type* third_party_realloc = []() -> realloc_func_type * {
+        return dlsym_next<realloc_func_type*>("realloc");
+	}();
+	return third_party_realloc;
+}
+
 using std::experimental::optional;
 
 using allocate_system_memory_fn
@@ -110,25 +156,33 @@ class page_list_link {
     friend class page_list;
 };
 
-static char* mem_base() {
+static const size_t mem_alloc_size = size_t(1) << 44;
+
+char* mem_base() {
     static char* known;
     static std::once_flag flag;
     std::call_once(flag, [] {
-        size_t alloc = size_t(1) << 44;
-        auto r = ::mmap(NULL, 2 * alloc,
+        auto r = ::mmap(NULL, 2 * mem_alloc_size,
                     PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                     -1, 0);
         if (r == MAP_FAILED) {
             abort();
         }
-        ::madvise(r, 2 * alloc, MADV_DONTDUMP);
+        ::madvise(r, 2 * mem_alloc_size, MADV_DONTDUMP);
         auto cr = reinterpret_cast<char*>(r);
-        known = align_up(cr, alloc);
+        known = align_up(cr, mem_alloc_size);
         ::munmap(cr, known - cr);
-        ::munmap(known + alloc, cr + 2 * alloc - (known + alloc));
+        ::munmap(known + mem_alloc_size, cr + 2 * mem_alloc_size - (known + mem_alloc_size));
     });
     return known;
+}
+
+bool is_seastar_memory(void * ptr)
+{
+	auto begin = mem_base();
+	auto end = begin + mem_alloc_size;
+	return ptr >= begin && ptr < end;
 }
 
 class small_pool;
@@ -599,7 +653,9 @@ void cpu_pages::shrink(void* ptr, size_t new_size) {
 }
 
 cpu_pages::~cpu_pages() {
-    live_cpus[cpu_id].store(false, std::memory_order_relaxed);
+    if (cpu_id != unsigned(-1)) {
+        live_cpus[cpu_id].store(false, std::memory_order_relaxed);
+    }
 }
 
 bool cpu_pages::is_initialized() const {
@@ -939,6 +995,11 @@ size_t object_size(void* ptr) {
 }
 
 void* allocate(size_t size) {
+	if (!configured && !in_load) {
+		//configured gets set to true when memory::configure() gets called
+		return (*get_third_party_malloc_func())(size);
+	}
+
     ++g_allocs;
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
@@ -967,6 +1028,10 @@ void* allocate_aligned(size_t align, size_t size) {
 }
 
 void free(void* obj) {
+    if (!is_seastar_memory(obj)) {
+        (*get_third_party_free_func())(obj);
+        return;
+    }
     ++g_frees;
     cpu_mem.free(obj);
 }
@@ -999,6 +1064,7 @@ reclaimer::~reclaimer() {
 
 void configure(std::vector<resource::memory> m,
         optional<std::string> hugetlbfs_path) {
+    configured = true;
     size_t total = 0;
     for (auto&& x : m) {
         total += x.bytes;
@@ -1121,6 +1187,10 @@ void* __libc_calloc(size_t n, size_t m) throw ();
 extern "C"
 [[gnu::visibility("default")]]
 void* realloc(void* ptr, size_t size) {
+	if (!configured || (ptr != nullptr && !is_seastar_memory(ptr))) {
+		void * new_ptr = (*get_third_party_realloc_func())(ptr, size);
+		return new_ptr;
+	}
     auto old_size = ptr ? object_size(ptr) : 0;
     if (size == old_size) {
         return ptr;
@@ -1352,6 +1422,7 @@ reclaimer::~reclaimer() {
 void set_reclaim_hook(std::function<void (std::function<void ()>)> hook) {
 }
 
+
 void configure(std::vector<resource::memory> m, std::experimental::optional<std::string> hugepages_path) {
 }
 
@@ -1370,6 +1441,10 @@ translate(const void* addr, size_t size) {
 
 memory_layout get_memory_layout() {
     throw std::runtime_error("get_memory_layout() not supported");
+}
+
+bool is_seastar_memory(void * ptr) {
+    return false;
 }
 
 }

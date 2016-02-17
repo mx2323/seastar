@@ -51,6 +51,9 @@
 /// should be limited to avoid cache coherency traffic.
 namespace memory {
 
+// is this ptr from seastar memory allocator?
+bool is_seastar_memory(void * ptr);
+
 /// \cond internal
 // TODO: Use getpagesize() in order to learn a size of a system PAGE.
 static constexpr size_t page_bits = 12;
